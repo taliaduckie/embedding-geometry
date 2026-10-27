@@ -1,0 +1,7 @@
+# TransformerLens 4.0 removed HookedTransformer; this project uses the 3.x API.
+transformer_lens<4
+torch>=2.1
+numpy
+scipy
+scikit-learn
+matplotlib

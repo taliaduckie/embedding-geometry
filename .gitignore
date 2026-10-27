@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Generated outputs
+fig_*.png
+figures/*
+!figures/.gitkeep
+results/*
+!results/.gitkeep
+
+# Model caches and secrets
+.cache/
+.env
+
+# OS
+.DS_Store
