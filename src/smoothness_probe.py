@@ -310,7 +310,8 @@ def endpoint_acts(frame, word):
 
 
 def clean_logprobs(frame, word):
-    return model(build_tokens(frame, [word]))[0, -1].double().log_softmax(-1).cpu()
+    # .cpu() before .double(): MPS has no float64
+    return model(build_tokens(frame, [word]))[0, -1].cpu().double().log_softmax(-1)
 
 
 def mix(a, b, alphas, norm_match=NORM_MATCH):
@@ -341,7 +342,7 @@ def run_patched(frame, li, vecs):
     logits = model.run_with_hooks(
         toks, fwd_hooks=[(hook_name(li), patch), (hook_name(N_LAYERS), grab)])
     # float64 log-softmax keeps tiny fine-resolution KLs above the noise floor
-    return store["final"], logits[:, -1].double().log_softmax(-1).cpu()
+    return store["final"], logits[:, -1].cpu().double().log_softmax(-1)
 
 
 def step_kl(logp):
