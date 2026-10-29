@@ -110,7 +110,15 @@ model = HookedTransformer.from_pretrained_no_processing(MODEL_NAME, device=devic
 if RANDOM_BASELINE:
     torch.manual_seed(SEED)
     model.init_weights()
-    print("RANDOM BASELINE: weights re-initialized")
+    # TransformerLens init_weights only redraws parameters named W_*. biases
+    # (b_Q, b_K, b_V, b_O, b_in, b_out, b_U) and LayerNorm scale/shift keep
+    # their PRETRAINED values, so the "untrained" model isn't. reset them.
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if "W_" not in n:
+                p.fill_(1.0) if n.endswith(".w") else p.zero_()
+    n_bias = sum(1 for n, _ in model.named_parameters() if "W_" not in n)
+    print(f"RANDOM BASELINE: weights re-initialized, {n_bias} bias/LN params reset")
 
 N_LAYERS = model.cfg.n_layers
 D = model.cfg.d_model
