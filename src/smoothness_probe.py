@@ -217,27 +217,43 @@ def layer_stats(acts):
         cos = rn @ rn.T
         aniso = cos[np.triu_indices_from(cos, k=1)].mean()
 
-        preds = []
         Xt = acts[li, train_frames].numpy()  # [F-1, W, D]
-        for w in range(W):
-            keep = np.array([i for i in range(W) if i != w])
-            p = make_probe().fit(Xt[:, keep].reshape(-1, D), np.tile(RANK[keep], Xt.shape[0]))
-            preds.append(p.predict(Xt[:, w]).mean())
-        # with ~7 words, a single LOWO spearman is noisy; report its p-value too.
-        # even an untrained model can hit rho ~0.6 by chance at n=7.
-        lowo, lowo_p = spearmanr(preds, RANK)
+
+        def lowo_rho(labels):
+            """train on W-1 words, predict the held-out word's label, for each word."""
+            preds = []
+            for w in range(W):
+                keep = np.array([i for i in range(W) if i != w])
+                p = make_probe().fit(Xt[:, keep].reshape(-1, D),
+                                     np.tile(labels[keep], Xt.shape[0]))
+                preds.append(p.predict(Xt[:, w]).mean())
+            return spearmanr(preds, labels)[0]
+
+        lowo = lowo_rho(RANK)
+        # permutation null over the WHOLE procedure, not scipy's p-value. leave-
+        # one-out has a negative bias: hold out the top word and the training
+        # mean drops, so its prediction regresses below it. the null is centered
+        # below zero (an untrained GPT-2 scores rho ~ -0.8 from this alone), so
+        # the question is whether the observed rho beats shuffled-label runs.
+        lowo_null = np.array([lowo_rho(RANK[p]) for p in perms])
+        lowo_p = ((lowo_null >= lowo).sum() + 1) / (len(perms) + 1)
 
         rows.append(dict(rho=rho, rho_p=(rho_null >= rho).mean(),
                          tort=tort, tort_pct=(tort_null <= tort).mean(),
-                         aniso=aniso, lowo=lowo, lowo_p=lowo_p))
+                         aniso=aniso, lowo=lowo, lowo_p=lowo_p,
+                         lowo_null=lowo_null.mean()))
     return rows
 
 
 stats = layer_stats(acts)
-print(f"{'layer':>5} {'|rho|':>6} {'p':>6} {'tort':>6} {'pct':>5} {'cos':>5} {'LOWO rho':>9} {'p':>6}")
+print(f"{'layer':>5} {'|rho|':>6} {'p':>6} {'tort':>6} {'pct':>5} {'cos':>5} "
+      f"{'LOWO rho':>9} {'null':>6} {'p':>6}")
 for li, s in enumerate(stats):
     print(f"{li:5d} {s['rho']:6.2f} {s['rho_p']:6.3f} {s['tort']:6.2f} "
-          f"{s['tort_pct']:5.2f} {s['aniso']:5.2f} {s['lowo']:9.2f} {s['lowo_p']:6.3f}")
+          f"{s['tort_pct']:5.2f} {s['aniso']:5.2f} {s['lowo']:9.2f} "
+          f"{s['lowo_null']:6.2f} {s['lowo_p']:6.3f}")
+print("LOWO p is a permutation p-value (shuffled labels, whole procedure); "
+      "null = mean shuffled rho, which sits below 0 by leave-one-out bias.")
 
 fig, ax = plt.subplots(1, 4, figsize=(17, 3.2))
 ax[0].plot([s["rho"] for s in stats], marker="o", label="|spearman|")
@@ -249,9 +265,11 @@ ax[1].axhline(0.05, color="gray", ls=":")
 ax[1].set_title("tortuosity percentile vs shuffles\n(low = unusually straight)")
 ax[2].plot([s["aniso"] for s in stats], marker="o")
 ax[2].set_title("anisotropy (mean cosine)")
-ax[3].plot([s["lowo"] for s in stats], marker="o")
+ax[3].plot([s["lowo"] for s in stats], marker="o", label="observed")
+ax[3].plot([s["lowo_null"] for s in stats], marker="x", ls="--", label="shuffled-label mean")
 ax[3].axhline(0, color="gray", ls=":")
 ax[3].set_title("leave-one-word-out probe (spearman)")
+ax[3].legend(fontsize=7)
 for a in ax:
     a.set_xlabel("layer (0 = embeddings)")
 plt.tight_layout()
@@ -383,6 +401,10 @@ def sweep(word_a, word_b, alphas, layers=SHOW_LAYERS, frame=INTERP_FRAME,
     clean = clean_logprobs(frame, word_a)
     probe = readout_probe({word_a, word_b})
     ref = acts[:, INTERP_FRAME_IDX]  # [N_POINTS, W, D] real word activations
+    # the endpoints are in the reference set, so "nearest word" would trivially
+    # read A then B. exclude them: which OTHER word is nearest at each alpha, and
+    # how far is the chord from it, relative to the A-B distance?
+    others = [i for i, w in enumerate(WORDS) if w not in (word_a, word_b)]
     res = {}
     for li in layers:
         vecs = mix(A[li], B[li], alphas, norm_match)
@@ -390,12 +412,13 @@ def sweep(word_a, word_b, alphas, layers=SHOW_LAYERS, frame=INTERP_FRAME,
         # free bug check: alpha=0 must reproduce the clean run for word A
         err = (logp[0] - clean).abs().max().item()
         assert err < 1e-3, f"alpha=0 doesn't match clean run at layer {li} (max diff {err:.2e})"
-        nn = torch.cdist(vecs, ref[li]).argmin(-1)
+        d = torch.cdist(vecs, ref[li][others])  # [n_alpha, n_others]
         res[li] = dict(
             readout=probe.predict(final.numpy()),
             kl_full=step_kl(logp),
             kl_content=step_kl(renorm(logp, CONTENT)),
-            nearest=[WORDS[i] for i in nn],
+            nearest=[WORDS[others[i]] for i in d.argmin(-1)],
+            rel_dist=(d.min(-1).values / (A[li] - B[li]).norm()).numpy(),
             trivial=(li == N_LAYERS),
         )
     return res
@@ -403,11 +426,16 @@ def sweep(word_a, word_b, alphas, layers=SHOW_LAYERS, frame=INTERP_FRAME,
 
 def summarize(word_a, word_b, coarse, fine):
     print(f"\n{word_a} → {word_b}")
-    print(f"{'layer':>5} {'maxKL coarse':>13} {'maxKL fine':>11} {'ratio':>6}   nearest real word along the chord")
+    print(f"{'layer':>5} {'maxKL coarse':>13} {'maxKL fine':>11} {'ratio':>6} "
+          f"{'dist/|A-B|':>11}   nearest OTHER word along the chord")
     for li in fine:
         c, f = coarse[li]["kl_content"].max(), fine[li]["kl_content"].max()
+        r = fine[li]["rel_dist"]
         tag = "  (final layer: readout trivially linear)" if fine[li]["trivial"] else ""
-        print(f"{li:5d} {c:13.2e} {f:11.2e} {c / f:6.1f}   {runs(fine[li]['nearest'])}{tag}")
+        print(f"{li:5d} {c:13.2e} {f:11.2e} {c / f:6.1f} {r.min():5.2f}-{r.max():4.2f}   "
+              f"{runs(fine[li]['nearest'])}{tag}")
+    print("dist/|A-B|: distance from the chord to the nearest non-endpoint word, "
+          "as a fraction of the endpoint distance (min-max over alpha).")
     print("ratio ≈16: smooth at this resolution. ≈1: transition narrower than the fine step.")
 
 
