@@ -20,6 +20,17 @@ Order matters: debug the harness on cheap models before paying for GPU time.
       LOWO rho 0.8, permutation p 0.003 at every layer; random baseline rho ~0,
       p 0.2 to 0.6. Layer 0 (raw embeddings) already scores rho 0.82. Tier
       membership is a judgment call; revisit against a ratings source.
+      Follow-up 2026-10-29: leave-one-TIER-out added. It is the honest
+      generalization test with synonym tiers, and it is much weaker: 6-tier
+      layout rho 0.24 to 0.58 (p 0.01 to 0.07, best late), 7-tier layout
+      (amazing / incredible / fantastic split above excellent) rho 0.12 to 0.44,
+      significant only at layers 10 to 12. Random baseline near 0 for both.
+      So LOWO's 0.8 was mostly synonym matching. GPT-2 places amazing /
+      incredible / fantastic below excellent / superb / brilliant, against
+      the entailment split. End tiers compress to the training mean (ridge
+      can't extrapolate): "perfect" held out is predicted mid-scale, so LOTO
+      says nothing about pushing past the endpoints. Default layout is still
+      the 7-tier split; both are selectable via WORD_SET.
 
 ## Probe improvements
 
