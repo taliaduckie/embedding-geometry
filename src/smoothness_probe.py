@@ -62,23 +62,37 @@ MODEL_NAME = "gpt2-small"   # also try "pythia-410m", "gpt2-medium"
 RANDOM_BASELINE = False     # True = untrained weights, same tokenizer
 WORD_SET = "intensifier"    # "intensifier" (one pole) or "valence" (two poles)
 N_SHUFFLE = 1000            # random orderings for the null distributions
+N_LOWO_SHUFFLE = 300        # LOWO null refits a probe per word per draw; keep it cheaper
 ALPHAS_COARSE = np.linspace(0, 1, 41)
 ALPHAS_FINE = np.linspace(0, 1, 161)   # 4x resolution -> smooth predicts ~16x
 NORM_MATCH = True
 INTERP_FRAME_IDX = 0        # frame used for interpolation; probes never train on it
 SEED = 0
 
-# intensifiers: one pole, weakest to strongest. this ordering IS the claim being
-# tested, so ground it in human ratings (de Melo & Bansal 2013; Garí Soler &
-# Apidianaki 2020) rather than intuition. near-ties (excellent / amazing) add
-# noise to every rank statistic; drop one if the ratings say they tie.
+# word sets are lists of TIERS, weakest to strongest. words in one tier share a
+# rank. the between-tier order is the claim being tested, so it rests on
+# Horn-scale entailment ("good but not great" is fine, "great but not good" is
+# not): perfect > excellent > great > good > decent > okay. within a tier
+# entailment gives no order (great / wonderful / terrific), so they tie rather
+# than get an order from intuition. ties are fine for every statistic here:
+# spearman uses average ranks, LOWO predicts a tier, and tortuosity runs through
+# tier centroids. tier membership is still a judgment call; move words if a
+# ratings source (de Melo & Bansal 2013; Garí Soler & Apidianaki 2020) says so.
 WORD_SETS = {
-    "intensifier": ["okay", "decent", "good", "great", "excellent", "amazing", "perfect"],
+    "intensifier": [
+        ["okay", "fine"],
+        ["decent", "solid"],
+        ["good", "nice"],
+        ["great", "wonderful", "terrific", "awesome"],
+        ["excellent", "superb", "outstanding", "brilliant", "amazing", "incredible", "fantastic"],
+        ["perfect", "flawless"],
+    ],
     # valence spans two poles. if the model codes valence and extremeness
     # separately, this path folds into a V and inflates tortuosity. if you run
     # it, call the result a sentiment scale, not an intensifier scale.
-    "valence": ["terrible", "awful", "bad", "poor", "mediocre", "okay",
-                "decent", "good", "great", "excellent", "amazing", "fantastic", "perfect"],
+    "valence": [[w] for w in ["terrible", "awful", "bad", "poor", "mediocre", "okay",
+                              "decent", "good", "great", "excellent", "amazing",
+                              "fantastic", "perfect"]],
 }
 # (A, B) pairs to interpolate. the last is a control across the semantic gap.
 PAIRS = [("good", "excellent"), ("okay", "perfect"), ("good", "purple")]
@@ -132,11 +146,13 @@ def is_single_token(word):
     return model.to_tokens(" " + word, prepend_bos=False).shape[1] == 1
 
 
-WORDS = [w for w in WORD_SETS[WORD_SET] if is_single_token(w)]
-print("kept:", WORDS)
+TIERS = [[w for w in tier if is_single_token(w)] for tier in WORD_SETS[WORD_SET]]
+WORDS = [w for tier in TIERS for w in tier]
+RANK = np.array([t for t, tier in enumerate(TIERS) for _ in tier])  # tier index per word
+print("tiers:", " < ".join("{" + ", ".join(t) + "}" for t in TIERS))
 print("dropped (multi-token, can't patch cleanly):",
-      [w for w in WORD_SETS[WORD_SET] if w not in WORDS])
-RANK = np.arange(len(WORDS))
+      [w for tier in WORD_SETS[WORD_SET] for w in tier if w not in WORDS])
+assert all(TIERS), "a tier lost all its words to the single-token filter"
 for a_w, b_w in PAIRS:
     for w in (a_w, b_w):
         assert is_single_token(w), f"pair word {w!r} is multi-token; pick another"
@@ -175,7 +191,7 @@ print("acts:", tuple(acts.shape))
 # per layer:
 # - **ordering**: PC1 of frame-centered activations vs the hypothesized rank.
 #   reported as |spearman| plus a permutation p-value (shuffled rank labels).
-# - **tortuosity**: path length through the frame-averaged words in order,
+# - **tortuosity**: path length through the tier centroids in order,
 #   divided by endpoint distance. reported with its percentile among random
 #   orderings of the same points. low percentile = the true order is
 #   unusually straight.
@@ -194,6 +210,11 @@ def tortuosity(m):
     return np.linalg.norm(np.diff(m, axis=0), axis=1).sum() / np.linalg.norm(m[-1] - m[0])
 
 
+def tier_centroids(m, labels):
+    """[W, D] word centroids -> [T, D] centroid per distinct label, in label order."""
+    return np.stack([m[labels == t].mean(axis=0) for t in np.unique(labels)])
+
+
 def layer_stats(acts):
     W = acts.shape[2]
     perms = [rng.permutation(W) for _ in range(N_SHUFFLE)]
@@ -209,8 +230,8 @@ def layer_stats(acts):
         rho_null = np.array([abs(spearmanr(pc1, np.tile(RANK[p], F))[0]) for p in perms])
 
         m = Xc.mean(axis=0)  # [W, D], frame-averaged
-        tort = tortuosity(m)
-        tort_null = np.array([tortuosity(m[p]) for p in perms])
+        tort = tortuosity(tier_centroids(m, RANK))
+        tort_null = np.array([tortuosity(tier_centroids(m, RANK[p])) for p in perms])
 
         raw = X.reshape(-1, D)
         rn = raw / np.linalg.norm(raw, axis=1, keepdims=True)
@@ -235,8 +256,8 @@ def layer_stats(acts):
         # mean drops, so its prediction regresses below it. the null is centered
         # below zero (an untrained GPT-2 scores rho ~ -0.8 from this alone), so
         # the question is whether the observed rho beats shuffled-label runs.
-        lowo_null = np.array([lowo_rho(RANK[p]) for p in perms])
-        lowo_p = ((lowo_null >= lowo).sum() + 1) / (len(perms) + 1)
+        lowo_null = np.array([lowo_rho(RANK[p]) for p in perms[:N_LOWO_SHUFFLE]])
+        lowo_p = ((lowo_null >= lowo).sum() + 1) / (len(lowo_null) + 1)
 
         rows.append(dict(rho=rho, rho_p=(rho_null >= rho).mean(),
                          tort=tort, tort_pct=(tort_null <= tort).mean(),
@@ -283,7 +304,8 @@ for a, li in zip(axes, SHOW_LAYERS):
     X = acts[li].numpy()
     m = (X - X.mean(axis=1, keepdims=True)).mean(axis=0)
     p = PCA(n_components=2).fit_transform(m)
-    a.plot(p[:, 0], p[:, 1], "-", color="lightgray", zorder=0)
+    c = tier_centroids(p, RANK)
+    a.plot(c[:, 0], c[:, 1], "-", color="lightgray", zorder=0)
     a.scatter(p[:, 0], p[:, 1], c=RANK, cmap="viridis", zorder=1)
     for (x, y), w in zip(p, WORDS):
         a.annotate(w, (x, y), fontsize=7)
