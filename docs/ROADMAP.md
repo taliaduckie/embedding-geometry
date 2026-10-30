@@ -13,10 +13,13 @@ Order matters: debug the harness on cheap models before paying for GPU time.
 - [ ] Check the cosine between the one-pole intensity direction and a
       Tigges-style valence direction. If near 1, the honest framing is
       "steering along valence magnitude".
-- [ ] Order the word list by Horn-scale entailment, not ratings. Drop one of any
-      pair entailment doesn't order (amazing / fantastic). Add single-token words
-      if the random baseline isn't clearly beaten: fine, nice, solid, superb,
-      wonderful, terrific, awesome, incredible, brilliant, outstanding, flawless.
+- [x] Order the word list by Horn-scale entailment, not ratings. Done 2026-10-29
+      as six entailment TIERS with tied ranks (okay/fine < decent/solid < good/nice
+      < great/... < excellent/... < perfect/flawless), 19 single-token words.
+      Words entailment can't order tie instead of being dropped. Result: trained
+      LOWO rho 0.8, permutation p 0.003 at every layer; random baseline rho ~0,
+      p 0.2 to 0.6. Layer 0 (raw embeddings) already scores rho 0.82. Tier
+      membership is a judgment call; revisit against a ratings source.
 
 ## Probe improvements
 
