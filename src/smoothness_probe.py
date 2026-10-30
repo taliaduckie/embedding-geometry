@@ -60,7 +60,7 @@ torch.set_grad_enabled(False)
 # ---------------- config (everything you'd change lives here) ----------------
 MODEL_NAME = "gpt2-small"   # also try "pythia-410m", "gpt2-medium"
 RANDOM_BASELINE = False     # True = untrained weights, same tokenizer
-WORD_SET = "intensifier"    # "intensifier" (one pole) or "valence" (two poles)
+WORD_SET = "intensifier"    # "intensifier", "intensifier_6tier", or "valence" (two poles)
 N_SHUFFLE = 1000            # random orderings for the null distributions
 N_LOWO_SHUFFLE = 300        # LOWO null refits a probe per word per draw; keep it cheaper
 ALPHAS_COARSE = np.linspace(0, 1, 41)
@@ -78,8 +78,20 @@ SEED = 0
 # spearman uses average ranks, LOWO predicts a tier, and tortuosity runs through
 # tier centroids. tier membership is still a judgment call; move words if a
 # ratings source (de Melo & Bansal 2013; Garí Soler & Apidianaki 2020) says so.
+# "excellent but not amazing" reads fine and "amazing but not excellent" does
+# not, so amazing / incredible / fantastic sit above excellent. the 6-tier
+# layout keeps them tied with excellent, to check how much placement matters.
 WORD_SETS = {
     "intensifier": [
+        ["okay", "fine"],
+        ["decent", "solid"],
+        ["good", "nice"],
+        ["great", "wonderful", "terrific", "awesome"],
+        ["excellent", "superb", "outstanding", "brilliant"],
+        ["amazing", "incredible", "fantastic"],
+        ["perfect", "flawless"],
+    ],
+    "intensifier_6tier": [
         ["okay", "fine"],
         ["decent", "solid"],
         ["good", "nice"],
@@ -198,8 +210,13 @@ print("acts:", tuple(acts.shape))
 # - **anisotropy**: mean pairwise cosine of raw activations (the narrow cone).
 # - **leave-one-word-out probe**: ridge trained on all-but-one word (all frames
 #   except the interpolation frame), predicting the held-out word's rank.
-#   signed spearman across held-out predictions. this is the real
-#   "is there a scale direction" test.
+#   signed spearman across held-out predictions.
+# - **leave-one-tier-out probe**: same, but every word of one tier is held out
+#   at once. with synonym tiers, leave-one-word-out can pass by matching the
+#   held-out word to its tier-mates; leave-one-tier-out has to place a rung it
+#   never saw between its neighbours, which is what steering needs. end tiers
+#   compress (ridge can't extrapolate); spearman survives that. this is the
+#   real "is there a scale direction" test.
 
 
 def make_probe():
@@ -240,15 +257,27 @@ def layer_stats(acts):
 
         Xt = acts[li, train_frames].numpy()  # [F-1, W, D]
 
-        def lowo_rho(labels):
-            """train on W-1 words, predict the held-out word's label, for each word."""
-            preds = []
-            for w in range(W):
-                keep = np.array([i for i in range(W) if i != w])
+        def heldout_preds(labels, groups):
+            """for each group of word indices: train on the rest, predict the group.
+            one prediction per word, averaged over frames."""
+            preds = np.zeros(W)
+            for g in groups:
+                keep = np.array([i for i in range(W) if i not in g])
                 p = make_probe().fit(Xt[:, keep].reshape(-1, D),
                                      np.tile(labels[keep], Xt.shape[0]))
-                preds.append(p.predict(Xt[:, w]).mean())
-            return spearmanr(preds, labels)[0]
+                preds[g] = (p.predict(Xt[:, g].reshape(-1, D))
+                            .reshape(Xt.shape[0], len(g)).mean(axis=0))
+            return preds
+
+        def lowo_rho(labels):
+            """leave-one-WORD-out."""
+            return spearmanr(heldout_preds(labels, [[w] for w in range(W)]), labels)[0]
+
+        def loto(labels):
+            """leave-one-TIER-out: hold out every word that shares a label."""
+            groups = [list(np.flatnonzero(labels == t)) for t in np.unique(labels)]
+            preds = heldout_preds(labels, groups)
+            return spearmanr(preds, labels)[0], preds
 
         lowo = lowo_rho(RANK)
         # permutation null over the WHOLE procedure, not scipy's p-value. leave-
@@ -259,22 +288,34 @@ def layer_stats(acts):
         lowo_null = np.array([lowo_rho(RANK[p]) for p in perms[:N_LOWO_SHUFFLE]])
         lowo_p = ((lowo_null >= lowo).sum() + 1) / (len(lowo_null) + 1)
 
+        loto_rho, loto_preds = loto(RANK)
+        loto_null = np.array([loto(RANK[p])[0] for p in perms[:N_LOWO_SHUFFLE]])
+        loto_p = ((loto_null >= loto_rho).sum() + 1) / (len(loto_null) + 1)
+
         rows.append(dict(rho=rho, rho_p=(rho_null >= rho).mean(),
                          tort=tort, tort_pct=(tort_null <= tort).mean(),
                          aniso=aniso, lowo=lowo, lowo_p=lowo_p,
-                         lowo_null=lowo_null.mean()))
+                         lowo_null=lowo_null.mean(), loto=loto_rho, loto_p=loto_p,
+                         loto_null=loto_null.mean(), loto_preds=loto_preds))
     return rows
 
 
 stats = layer_stats(acts)
 print(f"{'layer':>5} {'|rho|':>6} {'p':>6} {'tort':>6} {'pct':>5} {'cos':>5} "
-      f"{'LOWO rho':>9} {'null':>6} {'p':>6}")
+      f"{'LOWO rho':>9} {'null':>6} {'p':>6} {'LOTO rho':>9} {'null':>6} {'p':>6}")
 for li, s in enumerate(stats):
     print(f"{li:5d} {s['rho']:6.2f} {s['rho_p']:6.3f} {s['tort']:6.2f} "
           f"{s['tort_pct']:5.2f} {s['aniso']:5.2f} {s['lowo']:9.2f} "
-          f"{s['lowo_null']:6.2f} {s['lowo_p']:6.3f}")
-print("LOWO p is a permutation p-value (shuffled labels, whole procedure); "
+          f"{s['lowo_null']:6.2f} {s['lowo_p']:6.3f} {s['loto']:9.2f} "
+          f"{s['loto_null']:6.2f} {s['loto_p']:6.3f}")
+print("LOWO / LOTO p are permutation p-values (shuffled labels, whole procedure); "
       "null = mean shuffled rho, which sits below 0 by leave-one-out bias.")
+
+# which words does the tier-held-out probe misplace? (diagnoses tier membership)
+_li = N_LAYERS // 2
+_pred = stats[_li]["loto_preds"]
+print(f"\nleave-one-tier-out predictions at layer {_li}, sorted (word: predicted rank / true tier):")
+print("  " + "  ".join(f"{WORDS[i]}: {_pred[i]:.1f}/{RANK[i]}" for i in np.argsort(_pred)))
 
 fig, ax = plt.subplots(1, 4, figsize=(17, 3.2))
 ax[0].plot([s["rho"] for s in stats], marker="o", label="|spearman|")
@@ -286,10 +327,12 @@ ax[1].axhline(0.05, color="gray", ls=":")
 ax[1].set_title("tortuosity percentile vs shuffles\n(low = unusually straight)")
 ax[2].plot([s["aniso"] for s in stats], marker="o")
 ax[2].set_title("anisotropy (mean cosine)")
-ax[3].plot([s["lowo"] for s in stats], marker="o", label="observed")
-ax[3].plot([s["lowo_null"] for s in stats], marker="x", ls="--", label="shuffled-label mean")
+ax[3].plot([s["lowo"] for s in stats], marker="o", label="leave-one-word-out")
+ax[3].plot([s["loto"] for s in stats], marker="s", label="leave-one-tier-out")
+ax[3].plot([s["lowo_null"] for s in stats], marker="x", ls="--", label="LOWO shuffled mean")
+ax[3].plot([s["loto_null"] for s in stats], marker="+", ls="--", label="LOTO shuffled mean")
 ax[3].axhline(0, color="gray", ls=":")
-ax[3].set_title("leave-one-word-out probe (spearman)")
+ax[3].set_title("held-out probes (spearman)")
 ax[3].legend(fontsize=7)
 for a in ax:
     a.set_xlabel("layer (0 = embeddings)")
