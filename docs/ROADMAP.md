@@ -29,8 +29,18 @@ Order matters: debug the harness on cheap models before paying for GPU time.
       incredible / fantastic below excellent / superb / brilliant, against
       the entailment split. End tiers compress to the training mean (ridge
       can't extrapolate): "perfect" held out is predicted mid-scale, so LOTO
-      says nothing about pushing past the endpoints. Default layout is still
-      the 7-tier split; both are selectable via WORD_SET.
+      says nothing about pushing past the endpoints. Default is the 6-tier
+      layout (tie when entailment intuition is uncertain); the split is
+      WORD_SET = "intensifier_7tier".
+- [x] Fixed-endpoint tortuosity null. Done 2026-10-31. The all-label shuffle
+      put the true order in the bottom 1 to 13 percent at every layer; with the
+      end tiers held fixed and only interior labels shuffled, the true order
+      sits at the 71st to 87th percentile. The "straighter than random" result
+      was entirely the endpoints being the farthest pair. The interior path
+      (decent .. excellent) is, if anything, wigglier than a random interior
+      ordering. Random baseline: 11 to 52 percent, chance. So the Arrangement
+      criterion is NOT supported in GPT-2 small; PC1 ordering and the held-out
+      probes carry the order claim, tortuosity does not.
 
 ## Probe improvements
 

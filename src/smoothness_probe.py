@@ -60,7 +60,7 @@ torch.set_grad_enabled(False)
 # ---------------- config (everything you'd change lives here) ----------------
 MODEL_NAME = "gpt2-small"   # also try "pythia-410m", "gpt2-medium"
 RANDOM_BASELINE = False     # True = untrained weights, same tokenizer
-WORD_SET = "intensifier"    # "intensifier", "intensifier_6tier", or "valence" (two poles)
+WORD_SET = "intensifier"    # "intensifier", "intensifier_7tier", or "valence" (two poles)
 N_SHUFFLE = 1000            # random orderings for the null distributions
 N_LOWO_SHUFFLE = 300        # LOWO null refits a probe per word per draw; keep it cheaper
 ALPHAS_COARSE = np.linspace(0, 1, 41)
@@ -78,25 +78,26 @@ SEED = 0
 # spearman uses average ranks, LOWO predicts a tier, and tortuosity runs through
 # tier centroids. tier membership is still a judgment call; move words if a
 # ratings source (de Melo & Bansal 2013; Garí Soler & Apidianaki 2020) says so.
-# "excellent but not amazing" reads fine and "amazing but not excellent" does
-# not, so amazing / incredible / fantastic sit above excellent. the 6-tier
-# layout keeps them tied with excellent, to check how much placement matters.
+# the 7-tier variant splits amazing / incredible / fantastic above excellent on
+# the intuition that "excellent but not amazing" reads fine. GPT-2 small places
+# them BELOW excellent when that tier is held out, so the default ties them:
+# when entailment intuition is uncertain, tie rather than guess. run both.
 WORD_SETS = {
     "intensifier": [
         ["okay", "fine"],
         ["decent", "solid"],
         ["good", "nice"],
         ["great", "wonderful", "terrific", "awesome"],
-        ["excellent", "superb", "outstanding", "brilliant"],
-        ["amazing", "incredible", "fantastic"],
+        ["excellent", "superb", "outstanding", "brilliant", "amazing", "incredible", "fantastic"],
         ["perfect", "flawless"],
     ],
-    "intensifier_6tier": [
+    "intensifier_7tier": [
         ["okay", "fine"],
         ["decent", "solid"],
         ["good", "nice"],
         ["great", "wonderful", "terrific", "awesome"],
-        ["excellent", "superb", "outstanding", "brilliant", "amazing", "incredible", "fantastic"],
+        ["excellent", "superb", "outstanding", "brilliant"],
+        ["amazing", "incredible", "fantastic"],
         ["perfect", "flawless"],
     ],
     # valence spans two poles. if the model codes valence and extremeness
@@ -206,7 +207,12 @@ print("acts:", tuple(acts.shape))
 # - **tortuosity**: path length through the tier centroids in order,
 #   divided by endpoint distance. reported with its percentile among random
 #   orderings of the same points. low percentile = the true order is
-#   unusually straight.
+#   unusually straight. two nulls: all labels shuffled, and FIXED-ENDPOINT,
+#   where the weakest and strongest tiers keep their words and only interior
+#   labels shuffle. the plain null is partly an endpoint effect (the end tiers
+#   are the farthest pair, which shrinks the denominator for every other
+#   ordering); the fixed-endpoint null asks whether the interior order is
+#   straight given those endpoints.
 # - **anisotropy**: mean pairwise cosine of raw activations (the narrow cone).
 # - **leave-one-word-out probe**: ridge trained on all-but-one word (all frames
 #   except the interpolation frame), predicting the held-out word's rank.
@@ -235,6 +241,14 @@ def tier_centroids(m, labels):
 def layer_stats(acts):
     W = acts.shape[2]
     perms = [rng.permutation(W) for _ in range(N_SHUFFLE)]
+    # fixed-endpoint permutations: words in the end tiers keep their labels,
+    # interior words' labels shuffle among themselves
+    interior = np.flatnonzero((RANK > RANK.min()) & (RANK < RANK.max()))
+    perms_fix = []
+    for _ in range(N_SHUFFLE):
+        q = np.arange(W)
+        q[interior] = interior[rng.permutation(len(interior))]
+        perms_fix.append(q)
     train_frames = [f for f in range(acts.shape[1]) if f != INTERP_FRAME_IDX]
     rows = []
     for li in range(N_POINTS):
@@ -249,6 +263,7 @@ def layer_stats(acts):
         m = Xc.mean(axis=0)  # [W, D], frame-averaged
         tort = tortuosity(tier_centroids(m, RANK))
         tort_null = np.array([tortuosity(tier_centroids(m, RANK[p])) for p in perms])
+        tort_null_fix = np.array([tortuosity(tier_centroids(m, RANK[p])) for p in perms_fix])
 
         raw = X.reshape(-1, D)
         rn = raw / np.linalg.norm(raw, axis=1, keepdims=True)
@@ -294,6 +309,7 @@ def layer_stats(acts):
 
         rows.append(dict(rho=rho, rho_p=(rho_null >= rho).mean(),
                          tort=tort, tort_pct=(tort_null <= tort).mean(),
+                         tort_pct_fix=(tort_null_fix <= tort).mean(),
                          aniso=aniso, lowo=lowo, lowo_p=lowo_p,
                          lowo_null=lowo_null.mean(), loto=loto_rho, loto_p=loto_p,
                          loto_null=loto_null.mean(), loto_preds=loto_preds))
@@ -301,15 +317,17 @@ def layer_stats(acts):
 
 
 stats = layer_stats(acts)
-print(f"{'layer':>5} {'|rho|':>6} {'p':>6} {'tort':>6} {'pct':>5} {'cos':>5} "
+print(f"{'layer':>5} {'|rho|':>6} {'p':>6} {'tort':>6} {'pct':>5} {'fixEP':>5} {'cos':>5} "
       f"{'LOWO rho':>9} {'null':>6} {'p':>6} {'LOTO rho':>9} {'null':>6} {'p':>6}")
 for li, s in enumerate(stats):
     print(f"{li:5d} {s['rho']:6.2f} {s['rho_p']:6.3f} {s['tort']:6.2f} "
-          f"{s['tort_pct']:5.2f} {s['aniso']:5.2f} {s['lowo']:9.2f} "
+          f"{s['tort_pct']:5.2f} {s['tort_pct_fix']:5.2f} {s['aniso']:5.2f} {s['lowo']:9.2f} "
           f"{s['lowo_null']:6.2f} {s['lowo_p']:6.3f} {s['loto']:9.2f} "
           f"{s['loto_null']:6.2f} {s['loto_p']:6.3f}")
 print("LOWO / LOTO p are permutation p-values (shuffled labels, whole procedure); "
       "null = mean shuffled rho, which sits below 0 by leave-one-out bias.")
+print("pct = tortuosity percentile vs all-label shuffles; fixEP = vs shuffles that "
+      "keep the end tiers fixed (tests interior straightness, not endpoint extremity).")
 
 # which words does the tier-held-out probe misplace? (diagnoses tier membership)
 _li = N_LAYERS // 2
@@ -322,9 +340,11 @@ ax[0].plot([s["rho"] for s in stats], marker="o", label="|spearman|")
 ax[0].plot([s["rho_p"] for s in stats], marker="x", ls="--", label="permutation p")
 ax[0].set_title("ordering along PC1")
 ax[0].legend(fontsize=7)
-ax[1].plot([s["tort_pct"] for s in stats], marker="o")
+ax[1].plot([s["tort_pct"] for s in stats], marker="o", label="all labels shuffled")
+ax[1].plot([s["tort_pct_fix"] for s in stats], marker="s", label="end tiers fixed")
 ax[1].axhline(0.05, color="gray", ls=":")
 ax[1].set_title("tortuosity percentile vs shuffles\n(low = unusually straight)")
+ax[1].legend(fontsize=7)
 ax[2].plot([s["aniso"] for s in stats], marker="o")
 ax[2].set_title("anisotropy (mean cosine)")
 ax[3].plot([s["lowo"] for s in stats], marker="o", label="leave-one-word-out")
