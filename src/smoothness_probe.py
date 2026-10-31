@@ -560,3 +560,178 @@ for a_w, b_w in PAIRS:
 a_w, b_w = PAIRS[0]
 raw = sweep(a_w, b_w, ALPHAS_FINE, norm_match=False)
 plot_sweep(raw, ALPHAS_FINE, a_w, b_w, f"{a_w}_{b_w}_nonormmatch")
+
+# %% [markdown]
+# ## experiment 3: direct steering sweep
+# the headline experiment. the interpolation is bounded by its endpoints; this
+# pushes past them. add lambda * v at the LAST position of a neutral frame
+# ("The movie was") at layer L and read the next-token distribution, which is
+# the adjective slot. there is no source word to leak, so a next-token readout
+# is legitimate here.
+#
+# directions, all unit norm, all learned at the layer they're applied:
+#   - probe: ridge direction from a probe trained on every word (rank from
+#     activation), mapped back to raw activation space.
+#   - mean-diff: top tier mean minus bottom tier mean (Gari Soler-style).
+#   - random: same norm, random direction. the null.
+# lambda is in units of the scale's SPAN along v in the real data (top tier
+# projection minus bottom tier projection), so lambda = 1 is "move as far as
+# okay -> perfect", and |lambda| > 1 is past the endpoints.
+#
+# readouts, averaged over frames:
+#   - E[tier]: expected tier under the next-token distribution restricted to
+#     the scale words. monotone in lambda = steering preserves order; passing
+#     through intermediate values = graded.
+#   - scale mass: total next-token probability on scale words. if it collapses,
+#     the slot is no longer an adjective slot: steering has left the data.
+#   - entropy of the full next-token distribution, and KL(clean || steered).
+#     fluency proxies. intensity that keeps rising while these blow up is a
+#     monotone but failed steer.
+# the probe readout from experiment 2 is NOT used: it was trained on scalar
+# word positions and the steered position is "was", which is off-distribution
+# for it.
+
+# %%
+STEER_LAYERS = [l for l in SHOW_LAYERS if l > 0]  # layer 0 is a token swap, not steering
+LAMBDAS = np.linspace(-3, 3, 61)                   # in span units; 0 is the clean run
+STEER_FRAMES = FRAMES
+TRAIN_FRAMES = [f for f in range(len(FRAMES)) if f != INTERP_FRAME_IDX]
+SCALE_TOKENS = torch.tensor([model.to_single_token(" " + w) for w in WORDS])
+RANK_T = torch.tensor(RANK, dtype=torch.float64)
+
+
+def probe_direction(li):
+    """unit ridge direction at layer li, probe trained on every word, raw space."""
+    X = acts[li][TRAIN_FRAMES].reshape(-1, D).numpy()
+    pipe = make_probe().fit(X, np.tile(RANK, len(TRAIN_FRAMES)))
+    w = pipe[-1].coef_ / pipe[0].scale_  # undo the StandardScaler
+    return torch.tensor(w / np.linalg.norm(w), dtype=torch.float32)
+
+
+def mean_diff_direction(li):
+    """unit (top tier mean - bottom tier mean) at layer li, frame-averaged."""
+    m = acts[li].mean(dim=0)  # [W, D]
+    v = m[RANK == RANK.max()].mean(0) - m[RANK == RANK.min()].mean(0)
+    return v / v.norm()
+
+
+def random_direction(li):
+    g = torch.Generator().manual_seed(SEED + 1000 + li)
+    v = torch.randn(D, generator=g)
+    return v / v.norm()
+
+
+def span_along(li, v):
+    """top tier minus bottom tier projection onto v, in the real data: the lambda unit."""
+    proj = acts[li].mean(dim=0) @ v
+    return float(proj[RANK == RANK.max()].mean() - proj[RANK == RANK.min()].mean())
+
+
+def steer(frame, li, v, shifts):
+    """add shifts[i] * v at the last position of frame at hook li. next-token log-probs [n, V]."""
+    toks = model.to_tokens(frame).repeat(len(shifts), 1)
+    delta = (torch.tensor(shifts, dtype=torch.float32)[:, None] * v[None]).to(
+        device=device, dtype=model.cfg.dtype)
+
+    def add(resid, hook):
+        resid[:, -1] += delta
+        return resid
+
+    logits = model.run_with_hooks(toks, fwd_hooks=[(hook_name(li), add)])
+    return logits[:, -1].cpu().double().log_softmax(-1)
+
+
+def readouts(logp):
+    p = logp.exp()
+    ps = p[:, SCALE_TOKENS]
+    mass = ps.sum(-1)
+    e_tier = (ps * RANK_T).sum(-1) / mass
+    entropy = -(p * logp).sum(-1)
+    return e_tier.numpy(), mass.numpy(), entropy.numpy()
+
+
+def sweep_direction(li, v, lambdas=LAMBDAS):
+    unit = span_along(li, v)
+    i0 = int(np.argmin(np.abs(lambdas)))
+    assert lambdas[i0] == 0, "lambda grid must contain 0 (the clean run)"
+    acc = {k: [] for k in ("e_tier", "mass", "entropy", "kl")}
+    for frame in STEER_FRAMES:
+        logp = steer(frame, li, v, lambdas * unit)
+        clean = model(model.to_tokens(frame))[0, -1].cpu().double().log_softmax(-1)
+        err = (logp[i0] - clean).abs().max().item()
+        assert err < 1e-3, f"lambda=0 doesn't match clean run at layer {li} ({err:.2e})"
+        e, m, h = readouts(logp)
+        kl = (clean.exp()[None] * (clean[None] - logp)).sum(-1).numpy()
+        for k, val in zip(acc, (e, m, h, kl)):
+            acc[k].append(val)
+    out = {k: np.stack(v).mean(axis=0) for k, v in acc.items()}
+    out["unit"] = unit
+    return out
+
+
+def steer_summary(r, lambdas=LAMBDAS):
+    """monotonicity, reversals and endpoint values for one sweep."""
+    e = r["e_tier"]
+    rho = spearmanr(lambdas, e)[0]
+    d = np.diff(e)
+    tol = 0.02 * (e.max() - e.min() + 1e-12)  # ignore wiggles under 2% of the range
+    sign = np.sign(rho) if rho != 0 else 1.0
+    reversals = int((sign * d < -tol).sum())
+    at = lambda x: int(np.argmin(np.abs(lambdas - x)))
+    return dict(rho=rho, reversals=reversals,
+                e_m1=e[at(-1)], e_0=e[at(0)], e_p1=e[at(1)], e_p3=e[at(3)],
+                mass_0=r["mass"][at(0)], mass_p1=r["mass"][at(1)], mass_p3=r["mass"][at(3)],
+                ent_0=r["entropy"][at(0)], ent_p1=r["entropy"][at(1)], ent_p3=r["entropy"][at(3)],
+                kl_p1=r["kl"][at(1)], kl_p3=r["kl"][at(3)])
+
+
+DIRECTIONS = {"probe": probe_direction, "mean-diff": mean_diff_direction, "random": random_direction}
+steer_results = {}
+for li in STEER_LAYERS:
+    for name, fn in DIRECTIONS.items():
+        v = fn(li)
+        steer_results[(li, name)] = sweep_direction(li, v)
+        # cosine between the two learned directions, and each with random
+        if name == "mean-diff":
+            cos = float(probe_direction(li) @ v)
+            steer_results[(li, name)]["cos_probe"] = cos
+
+print(f"\nsteering sweep: lambda in span units (1 = okay-tier -> perfect-tier distance along v)")
+print(f"{'layer':>5} {'direction':>10} {'rho':>6} {'rev':>4} "
+      f"{'E[tier] -1/0/+1/+3':>22} {'mass 0/+1/+3':>18} {'entropy 0/+1/+3':>18} {'KL +1/+3':>12}")
+for (li, name), r in steer_results.items():
+    s = steer_summary(r)
+    print(f"{li:5d} {name:>10} {s['rho']:6.2f} {s['reversals']:4d} "
+          f"{s['e_m1']:5.2f}/{s['e_0']:4.2f}/{s['e_p1']:4.2f}/{s['e_p3']:4.2f} "
+          f"{s['mass_0']:6.3f}/{s['mass_p1']:5.3f}/{s['mass_p3']:5.3f} "
+          f"{s['ent_0']:6.2f}/{s['ent_p1']:5.2f}/{s['ent_p3']:5.2f} "
+          f"{s['kl_p1']:6.2f}/{s['kl_p3']:5.2f}")
+for li in STEER_LAYERS:
+    print(f"layer {li:2d}: cos(probe, mean-diff) = {steer_results[(li, 'mean-diff')]['cos_probe']:.2f}, "
+          f"span unit: probe {steer_results[(li, 'probe')]['unit']:.1f}, "
+          f"mean-diff {steer_results[(li, 'mean-diff')]['unit']:.1f}")
+print("rho: spearman(lambda, E[tier]); rev: steps where E[tier] moves against the trend by >2% of its range.\n"
+      "pass = rho near 1, no reversals, E[tier] through intermediate values, mass and entropy stable past |lambda|=1.")
+
+# sharey per column so the random row reads as flat instead of autoscaling to its noise
+fig, axes = plt.subplots(len(DIRECTIONS), 4, figsize=(17, 3.3 * len(DIRECTIONS)),
+                         sharex=True, sharey="col")
+for row, name in zip(axes, DIRECTIONS):
+    for li in STEER_LAYERS:
+        r = steer_results[(li, name)]
+        for a, key in zip(row, ("e_tier", "mass", "entropy", "kl")):
+            a.plot(LAMBDAS, r[key], label=f"layer {li}")
+    row[0].set_ylabel(f"{name} direction")
+    for a in row:
+        a.axvline(-1, color="gray", ls=":", lw=0.8)
+        a.axvline(1, color="gray", ls=":", lw=0.8)
+for a, t in zip(axes[0], ("E[tier] of next token (scale words)", "next-token mass on scale words",
+                          "next-token entropy", "KL(clean || steered)")):
+    a.set_title(t)
+for a in axes[-1]:
+    a.set_xlabel("lambda (span units; dotted = endpoints)")
+axes[0][0].legend(fontsize=7)
+axes[0][3].set_yscale("log")  # shared down the column
+plt.tight_layout()
+plt.savefig("fig_steer.png", dpi=160)
+plt.show()

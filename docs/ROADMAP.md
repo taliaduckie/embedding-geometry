@@ -44,23 +44,34 @@ Order matters: debug the harness on cheap models before paying for GPU time.
 
 ## Probe improvements
 
-- [ ] Direct steering sweep: add lambda * v to neutral sentences, plot output
-      intensity and fluency against lambda. This is the headline experiment; the
-      interpolation is a bounded special case. A suffix readout ("out of ten,
-      I'd give it a") is legitimate here because there is no source word to leak.
+- [x] Direct steering sweep. Done 2026-10-31 as experiment 3. Directions:
+      probe (ridge weights, raw space), difference of tier means, random; all
+      learned at the layer they're applied; lambda in units of the scale's span
+      along v. Readouts: E[tier] of the next token over scale words, scale-word
+      mass, entropy, KL(clean || steered), averaged over all 12 frames.
+      Results, GPT-2 small: monotone, zero reversals, both learned directions,
+      every layer. Mean-diff steers much harder than the probe direction
+      (1.4 vs 0.3 tiers across +/-1 span at layer 6; cos between them 0.45).
+      Scale-word mass holds to |lambda| = 1 then collapses by 3 at layers 3-6
+      with entropy up ~1 nat; layers 9-12 degrade gracefully, and at layer 12
+      mean-diff mass rises. Random direction flat; random model nothing.
+      Not done: continuation perplexity (multi-token), per-word breakdown of
+      which scale words gain mass.
 - [ ] Replace nearest-word with distance from a bank of real activations,
       relative to typical spacing. Partly done: endpoints are now excluded from
       the reference set and the chord's distance to the nearest other word is
       reported as a fraction of |A-B|. Still relative to the endpoint distance,
       not to typical spacing, and GPT-2 small gives 0.6 to 1.0 everywhere.
-- [ ] Fluency readout: next-token entropy and continuation perplexity vs lambda.
+- [~] Fluency readout: next-token entropy and KL vs lambda done in the sweep;
+      continuation perplexity not done.
 - [x] Permutation p-value for the leave-one-word-out Spearman. Done as a
       sampled null (N_SHUFFLE draws) over the whole procedure, which also
       handles the leave-one-out negative bias: an untrained model scores
       rho near -0.8 from that bias alone, so scipy's zero-centred p was wrong.
 - [ ] Report the resolution ratio as an exponent, log(ratio) / log(4), and add a
       third resolution to confirm the scaling.
-- [ ] Garí Soler-style difference-of-means baseline direction.
+- [x] Garí Soler-style difference-of-means baseline direction. In the sweep;
+      it out-steers the probe direction.
 - [ ] Whitening / cosine switch for rogue dimensions; report geometry stats with
       massive-activation dimensions zeroed.
 
